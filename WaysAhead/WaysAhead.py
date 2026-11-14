@@ -7,12 +7,9 @@ from math import radians, sin, cos, sqrt, atan2
 from typing import Optional
 
 import httpx
-import os
-from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, Integer, Float, String
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from pydantic import BaseModel, Field
-from twilio.rest import Client
 from fastapi import APIRouter, HTTPException, Depends, FastAPI
 
 
@@ -20,14 +17,8 @@ from fastapi import APIRouter, HTTPException, Depends, FastAPI
 # Configuration  (from config.py)
 # ======================================================================
 
-load_dotenv()
-
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 OSRM_URL = "https://router.project-osrm.org"
-
-TWILIO_SID = os.getenv("TWILIO_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")
 
 FARE_SLABS = [
     {"max_km": 2, "fare": 10},
@@ -115,9 +106,8 @@ class Trip(Base):
     fare = Column(Float, nullable=True)
     estimated_wait_minutes = Column(Integer, nullable=True)
 
-    status = Column(String, default="started")  # started -> selected -> notified -> completed
+    status = Column(String, default="started")  # started -> selected -> completed
     created_at = Column(String, default=lambda: datetime.now().isoformat())
-    family_contact = Column(String, nullable=True)  # WhatsApp number, e.g. "+919876543210"
 
 
 # ======================================================================
@@ -152,7 +142,6 @@ class TripSelection(BaseModel):
     stop_type: str
     vehicle_type: str
     strategy: str
-    family_contact: str   # new field, e.g. "+919876543210"
 
 
 # ======================================================================
@@ -294,45 +283,6 @@ def calculate_fare(db: Session, origin_lat, origin_lon, dest_lat, dest_lon, vehi
 
 
 # ======================================================================
-# Notification service  (from notify_service.py)
-# ======================================================================
-
-def send_whatsapp_notification(to_number: str, message: str) -> dict:
-    """
-    Sends a WhatsApp message via Twilio Sandbox.
-    to_number must be in E.164 format, e.g. "+919876543210".
-    Both sender (sandbox) and receiver must have completed the Twilio
-    'join <code>' sandbox step for this to succeed.
-    """
-    if not TWILIO_SID or not TWILIO_AUTH_TOKEN or not TWILIO_WHATSAPP_FROM:
-        return {"success": False, "error": "Twilio credentials not configured in .env"}
-
-    try:
-        client = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
-        msg = client.messages.create(
-            from_=TWILIO_WHATSAPP_FROM,
-            to=f"whatsapp:{to_number}",
-            body=message
-        )
-        return {"success": True, "sid": msg.sid, "status": msg.status}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-def build_trip_message(trip) -> str:
-    """Compose a readable trip-summary message for the family member."""
-    return (
-        f"🚏 Trip Update\n"
-        f"Traveler is heading to destination via {trip.selected_stop_name} "
-        f"({trip.selected_stop_type.replace('_', ' ')}).\n"
-        f"Vehicle: {trip.vehicle_type}\n"
-        f"Fare: ₹{trip.fare}\n"
-        f"Estimated wait: {trip.estimated_wait_minutes} min\n"
-        f"Trip ID: {trip.trip_id}"
-    )
-
-
-# ======================================================================
 # Trip service  (from trip_service.py)
 # ======================================================================
 
@@ -375,7 +325,6 @@ def select_trip_options(db: Session, selection) -> Trip:
     trip.fare = fare_result.get("fare")
     trip.estimated_wait_minutes = arrival_result.get("estimated_wait_minutes")
     trip.status = "selected"
-    trip.family_contact = selection.family_contact
 
     db.commit()
     db.refresh(trip)
@@ -500,24 +449,6 @@ def view_trip(trip_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Trip not found")
     return trip.__dict__
 
-@trip_router.post("/notify/{trip_id}")
-def notify_family(trip_id: str, db: Session = Depends(get_db)):
-    trip = get_trip(db, trip_id)
-    if not trip:
-        raise HTTPException(status_code=404, detail="Trip not found")
-    if not trip.family_contact:
-        raise HTTPException(status_code=400, detail="No family contact saved for this trip")
-
-    message = build_trip_message(trip)
-    result = send_whatsapp_notification(trip.family_contact, message)
-
-    if result["success"]:
-        trip.status = "notified"
-        db.commit()
-
-    return result
-
-
 @trip_router.post("/confirm-arrival/{trip_id}")
 def confirm_arrival(trip_id: str, db: Session = Depends(get_db)):
     trip = get_trip(db, trip_id)
@@ -526,11 +457,6 @@ def confirm_arrival(trip_id: str, db: Session = Depends(get_db)):
 
     trip.status = "completed"
     db.commit()
-
-    # Optionally notify family that user arrived safely
-    if trip.family_contact:
-        arrival_msg = f"✅ Traveler has arrived safely at their destination.\nTrip ID: {trip.trip_id}"
-        send_whatsapp_notification(trip.family_contact, arrival_msg)
 
     return {
         "trip_id": trip.trip_id,
